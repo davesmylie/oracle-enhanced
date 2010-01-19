@@ -1,19 +1,25 @@
 begin
   require "java"
   require "jruby"
-  # Adds JRuby classloader to current thread classloader - as a result ojdbc14.jar should not be in $JRUBY_HOME/lib
-  java.lang.Thread.currentThread.setContextClassLoader(JRuby.runtime.jruby_class_loader)
+
+  # ojdbc14.jar file should be in JRUBY_HOME/lib or should be in ENV['PATH'] or load path
 
   ojdbc_jar = "ojdbc14.jar"
-  if ojdbc_jar_path = ENV["PATH"].split(/[:;]/).find{|d| File.exists?(File.join(d,ojdbc_jar))}
-    require File.join(ojdbc_jar_path,ojdbc_jar)
+
+  unless ENV_JAVA['java.class.path'] =~ Regexp.new(ojdbc_jar)
+    # On Unix environment variable should be PATH, on Windows it is sometimes Path
+    env_path = ENV["PATH"] || ENV["Path"] || ''
+    if ojdbc_jar_path = env_path.split(/[:;]/).concat($LOAD_PATH).find{|d| File.exists?(File.join(d,ojdbc_jar))}
+      require File.join(ojdbc_jar_path,ojdbc_jar)
+    end
   end
-  # import java.sql.Statement
-  # import java.sql.Connection
-  # import java.sql.SQLException
-  # import java.sql.Types
-  # import java.sql.DriverManager
+
   java.sql.DriverManager.registerDriver Java::oracle.jdbc.driver.OracleDriver.new
+
+  # set tns_admin property from TNS_ADMIN environment variable
+  if !java.lang.System.get_property("oracle.net.tns_admin") && ENV["TNS_ADMIN"]
+    java.lang.System.set_property("oracle.net.tns_admin", ENV["TNS_ADMIN"])
+  end
 
 rescue LoadError, NameError
   # JDBC driver is unavailable.
@@ -32,7 +38,7 @@ module ActiveRecord
   module ConnectionAdapters
 
     # JDBC database interface for JRuby
-    class OracleEnhancedJDBCConnection < OracleEnhancedConnection
+    class OracleEnhancedJDBCConnection < OracleEnhancedConnection #:nodoc:
 
       attr_accessor :active
       alias :active? :active
@@ -52,10 +58,19 @@ module ActiveRecord
         privilege = config[:privilege] && config[:privilege].to_s
         host, port = config[:host], config[:port]
 
-        url = config[:url] || "jdbc:oracle:thin:@#{host || 'localhost'}:#{port || 1521}:#{database || 'XE'}"
+        # connection using TNS alias
+        if database && !host && !config[:url] && ENV['TNS_ADMIN']
+          url = "jdbc:oracle:thin:@#{database || 'XE'}"
+        else
+          url = config[:url] || "jdbc:oracle:thin:@#{host || 'localhost'}:#{port || 1521}:#{database || 'XE'}"
+        end
 
         prefetch_rows = config[:prefetch_rows] || 100
-        cursor_sharing = config[:cursor_sharing] || 'similar'
+        cursor_sharing = config[:cursor_sharing] || 'force'
+        # by default VARCHAR2 column size will be interpreted as max number of characters (and not bytes)
+        nls_length_semantics = config[:nls_length_semantics] || 'CHAR'
+        # get session time_zone from configuration or from TZ environment variable
+        time_zone = config[:time_zone] || ENV['TZ'] || java.util.TimeZone.default.getID
 
         properties = java.util.Properties.new
         properties.put("user", username)
@@ -65,12 +80,13 @@ module ActiveRecord
 
         @raw_connection = java.sql.DriverManager.getConnection(url, properties)
         exec %q{alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'}
-        exec %q{alter session set nls_timestamp_format = 'YYYY-MM-DD HH24:MI:SS'} # rescue nil
-        exec "alter session set cursor_sharing = #{cursor_sharing}" # rescue nil
+        exec %q{alter session set nls_timestamp_format = 'YYYY-MM-DD HH24:MI:SS:FF6'}
+        exec "alter session set cursor_sharing = #{cursor_sharing}"
+        exec "alter session set nls_length_semantics = '#{nls_length_semantics}'"
         self.autocommit = true
         
         # Set session time zone to current time zone
-        @raw_connection.setSessionTimeZone(java.util.TimeZone.default.getID)
+        @raw_connection.setSessionTimeZone(time_zone)
         
         # Set default number of rows to prefetch
         # @raw_connection.setDefaultRowPrefetch(prefetch_rows) if prefetch_rows
@@ -159,16 +175,64 @@ module ActiveRecord
       end
 
       def exec_no_retry(sql)
-        cs = @raw_connection.prepareCall(sql)
         case sql
-        when /\A\s*UPDATE/i, /\A\s*INSERT/i, /\A\s*DELETE/i
-          cs.executeUpdate
+        when /\A\s*(UPDATE|INSERT|DELETE)/i
+          s = @raw_connection.prepareStatement(sql)
+          s.executeUpdate
+        # it is safer for CREATE and DROP statements not to use PreparedStatement
+        # as it does not allow creation of triggers with :NEW in their definition
+        when /\A\s*(CREATE|DROP)/i
+          s = @raw_connection.createStatement()
+          s.execute(sql)
+          true
         else
-          cs.execute
+          s = @raw_connection.prepareStatement(sql)
+          s.execute
           true
         end
       ensure
-        cs.close rescue nil        
+        s.close rescue nil
+      end
+
+      def returning_clause(quoted_pk)
+        " RETURNING #{quoted_pk} INTO ?"
+      end
+
+      # execute sql with RETURNING ... INTO :insert_id
+      # and return :insert_id value
+      def exec_with_returning(sql)
+        with_retry do
+          begin
+            # it will always be INSERT statement
+
+            # TODO: need to investigate why PreparedStatement is giving strange exception "Protocol violation"
+            # s = @raw_connection.prepareStatement(sql)
+            # s.registerReturnParameter(1, ::Java::oracle.jdbc.OracleTypes::NUMBER)
+            # count = s.executeUpdate
+            # if count > 0
+            #   rs = s.getReturnResultSet
+            #   if rs.next
+            #     # Assuming that primary key will not be larger as long max value
+            #     insert_id = rs.getLong(1)
+            #     rs.wasNull ? nil : insert_id
+            #   else
+            #     nil
+            #   end
+            # else
+            #   nil
+            # end
+            
+            # Workaround with CallableStatement
+            s = @raw_connection.prepareCall("BEGIN #{sql}; END;")
+            s.registerOutParameter(1, java.sql.Types::BIGINT)
+            s.execute
+            insert_id = s.getLong(1)
+            s.wasNull ? nil : insert_id
+          ensure
+            # rs.close rescue nil
+            s.close rescue nil
+          end
+        end
       end
 
       def select(sql, name = nil, return_column_names = false)
@@ -220,46 +284,10 @@ module ActiveRecord
         end
       end
 
-      def describe(name)
-        real_name = OracleEnhancedAdapter.valid_table_name?(name) ? name.to_s.upcase : name.to_s
-        if real_name.include?('.')
-          table_owner, table_name = real_name.split('.')
-        else
-          table_owner, table_name = @owner, real_name
-        end
-        sql = <<-SQL
-          SELECT owner, table_name, 'TABLE' name_type
-          FROM all_tables
-          WHERE owner = '#{table_owner}'
-            AND table_name = '#{table_name}'
-          UNION ALL
-          SELECT owner, view_name table_name, 'VIEW' name_type
-          FROM all_views
-          WHERE owner = '#{table_owner}'
-            AND view_name = '#{table_name}'
-          UNION ALL
-          SELECT table_owner, table_name, 'SYNONYM' name_type
-          FROM all_synonyms
-          WHERE owner = '#{table_owner}'
-            AND synonym_name = '#{table_name}'
-          UNION ALL
-          SELECT table_owner, table_name, 'SYNONYM' name_type
-          FROM all_synonyms
-          WHERE owner = 'PUBLIC'
-            AND synonym_name = '#{real_name}'
-        SQL
-        if result = select_one(sql)
-          case result['name_type']
-          when 'SYNONYM'
-            describe("#{result['owner']}.#{result['table_name']}")
-          else
-            [result['owner'], result['table_name']]
-          end
-        else
-          raise OracleEnhancedConnectionException, %Q{"DESC #{name}" failed; does it exist?}
-        end
+      # Return NativeException / java.sql.SQLException error code
+      def error_code(exception)
+        exception.cause.getErrorCode
       end
-      
 
       private
 

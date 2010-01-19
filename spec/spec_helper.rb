@@ -19,16 +19,21 @@ elsif ENV['RAILS_GEM_VERSION'] =~ /^2.2/
   gem 'actionpack', '=2.2.2'
   gem 'activesupport', '=2.2.2'
   gem 'composite_primary_keys', '=2.2.2'
+elsif ENV['RAILS_GEM_VERSION'] =~ /^2.3.3/
+  gem 'activerecord', '=2.3.3'
+  gem 'actionpack', '=2.3.3'
+  gem 'activesupport', '=2.3.3'
+  gem 'composite_primary_keys', '=2.3.2'
 else
-  ENV['RAILS_GEM_VERSION'] ||= '2.3.2'
-  gem 'activerecord', '=2.3.2'
-  gem 'actionpack', '=2.3.2'
-  gem 'activesupport', '=2.3.2'
-  gem 'composite_primary_keys', '=2.2.2'
+  ENV['RAILS_GEM_VERSION'] ||= '2.3.5'
+  gem 'activerecord', '=2.3.5'
+  gem 'actionpack', '=2.3.5'
+  gem 'activesupport', '=2.3.5'
+  NO_COMPOSITE_PRIMARY_KEYS = true
 end
 
-require 'activerecord'
-require 'actionpack'
+require 'active_record'
+require 'action_pack'
 if ENV['RAILS_GEM_VERSION'] >= '2.3'
   require 'action_controller/session/abstract_store'
   require 'active_record/session_store'
@@ -36,8 +41,16 @@ else
   require 'action_controller/session/active_record_store'
 end
 if !defined?(RUBY_ENGINE)
-  gem "activerecord-oracle-adapter"
-  require 'active_record/connection_adapters/oracle_adapter'
+  # change version to 1.0.6 to test with old oracle_adapter
+  gem 'ruby-oci8', '=2.0.3'
+  require 'oci8'
+  if OCI8::VERSION =~ /^1\./
+    gem "activerecord-oracle-adapter"
+    require 'active_record/connection_adapters/oracle_adapter'
+  end
+elsif RUBY_ENGINE == 'ruby'
+  gem 'ruby-oci8', '=2.0.3'
+  require 'oci8'
 elsif RUBY_ENGINE == 'jruby'
   gem "activerecord-jdbc-adapter"
   require 'active_record/connection_adapters/jdbc_adapter'
@@ -55,6 +68,16 @@ module LoggerSpecHelper
     end
     ActiveRecord::Base.colorize_logging = false
     ActiveRecord::Base.logger.level = Logger::DEBUG
+  end
+end
+
+module SchemaSpecHelper
+  def schema_define(&block)
+    ActiveRecord::Schema.define do
+      suppress_messages do
+        instance_eval(&block)
+      end
+    end
   end
 end
 
@@ -90,5 +113,17 @@ SYS_CONNECTION_PARAMS = {
   :privilege => "SYSDBA"
 }
 
+SYSTEM_CONNECTION_PARAMS = {
+  :adapter => "oracle_enhanced",
+  :database => DATABASE_NAME,
+  :host => DATABASE_HOST,
+  :username => "system",
+  :password => DATABASE_SYS_PASSWORD
+}
+
 # For JRuby Set default $KCODE to UTF8
 $KCODE = "UTF8" if defined?(RUBY_ENGINE) && RUBY_ENGINE == 'jruby'
+
+# set default time zone in TZ environment variable
+# which will be used to set session time zone
+ENV['TZ'] ||= 'Europe/Riga'

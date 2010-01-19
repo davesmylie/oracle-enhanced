@@ -1,4 +1,4 @@
-require File.dirname(__FILE__) + '/../../spec_helper.rb'
+require File.expand_path(File.dirname(__FILE__) + '/../../spec_helper')
 
 describe "OracleEnhancedAdapter custom methods for create, update and destroy" do
   include LoggerSpecHelper
@@ -6,7 +6,7 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
   before(:all) do
     ActiveRecord::Base.establish_connection(CONNECTION_PARAMS)
     @conn = ActiveRecord::Base.connection
-    plsql.connection = ActiveRecord::Base.connection.raw_connection
+    plsql.activerecord_class = ActiveRecord::Base
     @conn.execute("DROP TABLE test_employees") rescue nil
     @conn.execute <<-SQL
       CREATE TABLE test_employees (
@@ -18,7 +18,9 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
         description   CLOB,
         version       NUMBER(15,0),
         create_time   DATE,
-        update_time   DATE
+        update_time   DATE,
+        created_at    DATE,
+        updated_at    DATE
       )
     SQL
     @conn.execute("DROP SEQUENCE test_employees_s") rescue nil
@@ -168,10 +170,9 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
     TestEmployee.class_eval { def after_create() raise "Make the transaction rollback" end }
     begin
       employees_count = TestEmployee.count
-      @employee.save
-      fail "Did not raise exception"
-    rescue => e
-      e.message.should == "Make the transaction rollback"
+      lambda {
+        @employee.save
+      }.should raise_error("Make the transaction rollback")
       @employee.id.should == nil
       TestEmployee.count.should == employees_count
     ensure
@@ -205,10 +206,9 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
       empl_id = @employee.id
       @employee.reload
       @employee.first_name = "Second"
-      @employee.save!
-      fail "Did not raise exception"
-    rescue => e
-      e.message.should == "Make the transaction rollback"
+      lambda {
+        @employee.save
+      }.should raise_error("Make the transaction rollback")
       @employee.reload
       @employee.first_name.should == "First"
     ensure
@@ -257,20 +257,31 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
     TestEmployee.find_by_employee_id(empl_id).should be_nil
   end
 
-  it "should rollback record when exception is raised in after_desotry callback" do
-    TestEmployee.class_eval { def after_destroy() raise "Make the transaction rollback" end }
+  it "should delete record and set destroyed flag" do
+    return pending("Not in this ActiveRecord version (requires >= 2.3.5)") unless TestEmployee.method_defined?(:destroyed?)
     @employee = TestEmployee.create(
       :first_name => "First",
       :last_name => "Last",
       :hire_date => @today
     )
     @employee.reload
-    empl_id = @employee.id
+    @employee.destroy
+    @employee.should be_destroyed
+  end
+
+  it "should rollback record when exception is raised in after_desotry callback" do
+    TestEmployee.class_eval { def after_destroy() raise "Make the transaction rollback" end }
     begin
-      @employee.destroy
-      fail "Did not raise exception"
-    rescue => e
-      e.message.should == "Make the transaction rollback"
+      @employee = TestEmployee.create(
+        :first_name => "First",
+        :last_name => "Last",
+        :hire_date => @today
+      )
+      @employee.reload
+      empl_id = @employee.id
+      lambda {
+        @employee.destroy
+      }.should raise_error("Make the transaction rollback")
       @employee.id.should == empl_id
       TestEmployee.find_by_employee_id(empl_id).should_not be_nil
     ensure
@@ -278,10 +289,33 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
     end
   end
 
+  it "should set timestamps when creating record" do
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :hire_date => @today
+    )
+    @employee.created_at.should_not be_nil
+    @employee.updated_at.should_not be_nil
+  end
+
+  it "should set timestamps when updating record" do
+    @employee = TestEmployee.create(
+      :first_name => "First",
+      :last_name => "Last",
+      :hire_date => @today
+    )
+    @employee.reload
+    @employee.created_at.should be_nil
+    @employee.updated_at.should be_nil
+    @employee.first_name = "Second"
+    @employee.save!
+    @employee.created_at.should be_nil
+    @employee.updated_at.should_not be_nil
+  end
+
   it "should log create record" do
     log_to @buffer
-    # reestablish plsql.connection as log_to might reset existing connection
-    plsql.connection = ActiveRecord::Base.connection.raw_connection
     @employee = TestEmployee.create(
       :first_name => "First",
       :last_name => "Last",
@@ -298,8 +332,6 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
       :hire_date => @today
     )
     log_to @buffer
-    # reestablish plsql.connection as log_to might reset existing connection
-    plsql.connection = ActiveRecord::Base.connection.raw_connection
     @employee.save!
     @buffer.string.should match(/^TestEmployee Update \(\d+\.\d+(ms)?\)  custom update method with employee_id=#{@employee.id}$/)
   end
@@ -311,8 +343,6 @@ describe "OracleEnhancedAdapter custom methods for create, update and destroy" d
       :hire_date => @today
     )
     log_to @buffer
-    # reestablish plsql.connection as log_to might reset existing connection
-    plsql.connection = ActiveRecord::Base.connection.raw_connection
     @employee.destroy
     @buffer.string.should match(/^TestEmployee Destroy \(\d+\.\d+(ms)?\)  custom delete method with employee_id=#{@employee.id}$/)
   end

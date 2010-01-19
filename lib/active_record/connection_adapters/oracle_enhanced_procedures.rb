@@ -5,26 +5,82 @@ ActiveRecord::Base.class_eval do
 end
 
 require 'ruby_plsql'
-require 'activesupport'
+require 'active_support'
 
 module ActiveRecord #:nodoc:
   module ConnectionAdapters #:nodoc:
     module OracleEnhancedProcedures #:nodoc:
 
       module ClassMethods
+        # Specify custom create method which should be used instead of Rails generated INSERT statement.
+        # Provided block should return ID of new record.
+        # Example:
+        #   set_create_method do
+        #     plsql.employees_pkg.create_employee(
+        #       :p_first_name => first_name,
+        #       :p_last_name => last_name,
+        #       :p_employee_id => nil
+        #     )[:p_employee_id]
+        #   end
         def set_create_method(&block)
           include_with_custom_methods
           self.custom_create_method = block
         end
 
+        # Specify custom update method which should be used instead of Rails generated UPDATE statement.
+        # Example:
+        #   set_update_method do
+        #     plsql.employees_pkg.update_employee(
+        #       :p_employee_id => id,
+        #       :p_first_name => first_name,
+        #       :p_last_name => last_name
+        #     )
+        #   end
         def set_update_method(&block)
           include_with_custom_methods
           self.custom_update_method = block
         end
 
+        # Specify custom delete method which should be used instead of Rails generated DELETE statement.
+        # Example:
+        #   set_delete_method do
+        #     plsql.employees_pkg.delete_employee(
+        #       :p_employee_id => id
+        #     )
+        #   end
         def set_delete_method(&block)
           include_with_custom_methods
           self.custom_delete_method = block
+        end
+        
+        def create_method_name_before_custom_methods
+          if private_method_defined?(:create_without_timestamps) && defined?(ActiveRecord::VERSION) && ActiveRecord::VERSION::STRING.to_f >= 2.3
+            :create_without_timestamps
+          elsif private_method_defined?(:create_without_callbacks)
+            :create_without_callbacks
+          else
+            :create
+          end
+        end
+        
+        def update_method_name_before_custom_methods
+          if private_method_defined?(:update_without_dirty)
+            :update_without_dirty
+          elsif private_method_defined?(:update_without_timestamps) && defined?(ActiveRecord::VERSION) && ActiveRecord::VERSION::STRING.to_f >= 2.3
+            :update_without_timestamps
+          elsif private_method_defined?(:update_without_callbacks)
+            :update_without_callbacks
+          else
+            :update
+          end
+        end
+        
+        def destroy_method_name_before_custom_methods
+          if public_method_defined?(:destroy_without_callbacks)
+            :destroy_without_callbacks
+          else
+            :destroy
+          end
         end
         
         private
@@ -35,33 +91,16 @@ module ActiveRecord #:nodoc:
         end
       end
       
-      module InstanceMethods
+      module InstanceMethods #:nodoc:
         def self.included(base)
           base.instance_eval do
-            if private_instance_methods.include?('create_without_callbacks') || private_instance_methods.include?(:create_without_callbacks)
-              alias_method :create_without_custom_method, :create_without_callbacks
-              alias_method :create_without_callbacks, :create_with_custom_method
-            else
-              alias_method_chain :create, :custom_method
-            end
-            # insert after dirty checking in Rails 2.1
-            # in Ruby 1.9 methods names are returned as symbols
-            if private_instance_methods.include?('update_without_dirty') || private_instance_methods.include?(:update_without_dirty)
-              alias_method :update_without_custom_method, :update_without_dirty
-              alias_method :update_without_dirty, :update_with_custom_method
-            elsif private_instance_methods.include?('update_without_callbacks') || private_instance_methods.include?(:update_without_callbacks)
-              alias_method :update_without_custom_method, :update_without_callbacks
-              alias_method :update_without_callbacks, :update_with_custom_method
-            else
-              alias_method_chain :update, :custom_method
-            end
+            alias_method :create_without_custom_method, create_method_name_before_custom_methods
+            alias_method create_method_name_before_custom_methods, :create_with_custom_method
+            alias_method :update_without_custom_method, update_method_name_before_custom_methods
+            alias_method update_method_name_before_custom_methods, :update_with_custom_method
+            alias_method :destroy_without_custom_method, destroy_method_name_before_custom_methods
+            alias_method destroy_method_name_before_custom_methods, :destroy_with_custom_method
             private :create, :update
-            if public_instance_methods.include?('destroy_without_callbacks') || public_instance_methods.include?(:destroy_without_callbacks)
-              alias_method :destroy_without_custom_method, :destroy_without_callbacks
-              alias_method :destroy_without_callbacks, :destroy_with_custom_method
-            else
-              alias_method_chain :destroy, :custom_method
-            end
             public :destroy
           end
         end
@@ -104,6 +143,7 @@ module ActiveRecord #:nodoc:
             end
           end
 
+          @destroyed = true
           freeze
         end
 
