@@ -1155,18 +1155,38 @@ module ActiveRecord
         end
       end
 
-<<<<<<< HEAD:lib/active_record/connection_adapters/oracle_enhanced_adapter.rb
-      # DGS. Extract all stored procedures, packages,  synonyms and views.
-=======
-      # Extract all stored procedures, packages, synonyms and views.
->>>>>>> ce42b6ee9022bd0d723416440f7b447a6abe7d71:lib/active_record/connection_adapters/oracle_enhanced_adapter.rb
+      # Extract all synonyms, views, stored procedures functions, packages, and finally triggers
       def structure_dump_db_stored_code #:nodoc:
-        structure = "\n"
+        structure = "\n\n"
+
+        # export synonyms - this must be done before any views that require the synonym to exist
+        select_all("select owner, synonym_name, table_name, table_owner 
+                      from all_synonyms 
+                      where table_owner = sys_context('userenv','session_user') ").inject(structure) do |structure, synonym|
+          ddl = "create or replace #{synonym['owner'] == 'PUBLIC' ? 'PUBLIC' : '' } SYNONYM #{synonym['synonym_name']} for #{synonym['table_owner']}.#{synonym['table_name']};\n\n"
+          structure << ddl;
+        end
+
+        # export views - this must be done before any triggers (or where would a trigger on a view attach to?)
+        # Exclude any BIN$% objects (From Oracle 10g's recycle bin). This is still a little flakey as invalid views present
+        # in the source database (missing table etc) will cause the import to fall over. May need to check view status as well here...
+        select_all("select view_name, text from user_views where view_name not like 'BIN$%'").inject(structure) do |structure, view|
+          ddl = "create or replace view #{view['view_name']} AS\n "
+          # any views with empty lines will cause OCI to barf when loading. remove blank lines =/ 
+          ddl << view['text'].gsub(/^\n/, '') 
+          ddl << ";\n\n"
+          structure << ddl
+        end
+
+        # trigger code may reference procedures etc. Best if triggers go in after all other code.
+        # order by the type asc, so that they are.
+        # Exclude any BIN$% objects (From Oracle 10g's recycle bin)
         select_all("select distinct name, type 
                      from all_source 
-                    where type in ('PROCEDURE', 'PACKAGE', 'PACKAGE BODY', 'FUNCTION') 
-                      and  owner = sys_context('userenv','session_user')").inject("\n\n") do |structure, source|
-            ddl = "create or replace   \n "
+                    where type in ('PROCEDURE', 'PACKAGE', 'PACKAGE BODY', 'FUNCTION', 'TRIGGER') 
+                      and name not like 'BIN$%' 
+                      and  owner = sys_context('userenv','session_user') order by type asc").inject(structure) do |structure, source|
+            ddl = "create or replace  "
             lines = select_all(%Q{
                     select text
                       from all_source
@@ -1178,36 +1198,41 @@ module ActiveRecord
               ddl << row['text'] if row['text'].size > 1
             end
             ddl << ";"
-            structure << ddl << "\n"
+            structure << ddl << "\n\n"
         end
 
-        # export views 
-        select_all("select view_name, text from user_views").inject(structure) do |structure, view|
-          ddl = "create or replace view #{view['view_name']} AS\n "
-          # any views with empty lines will cause OCI to barf when loading. remove blank lines =/ 
-          ddl << view['text'].gsub(/^\n/, '') 
-          ddl << ";\n\n"
-          structure << ddl
-        end
-
-        # export synonyms 
-        select_all("select owner, synonym_name, table_name, table_owner 
-                      from all_synonyms  
-                     where table_owner = sys_context('userenv','session_user') ").inject(structure) do |structure, synonym|
-          ddl = "create or replace #{synonym['owner'] == 'PUBLIC' ? 'PUBLIC' : '' } SYNONYM #{synonym['synonym_name']} for #{synonym['table_owner']}.#{synonym['table_name']};\n\n"
-          structure << ddl;
-        end
       end
 
-
+      # Note that we're not excluding BIN objects here - otherwise they're likely to never get dropped in a test env
+      # Ideally we'd just empty the recycle bin
       def structure_drop #:nodoc:
         s = select_all("select sequence_name from user_sequences order by 1").inject("") do |drop, seq|
           drop << "drop sequence #{seq.to_a.first.last};\n\n"
         end
 
+        # drop synonyms
+        select_all("select owner, synonym_name, table_name, table_owner 
+                      from all_synonyms  
+                     where table_owner = sys_context('userenv','session_user') ").inject(s) do |drop, synonym|
+          drop << "drop #{synonym['owner'] == 'PUBLIC' ? 'PUBLIC' : '' }  SYNONYM #{synonym['synonym_name']};\n\n"
+        end
+
         # changed select from user_tables to all_tables - much faster in large data dictionaries
         select_all("select table_name from all_tables where owner = sys_context('userenv','session_user') order by 1").inject(s) do |drop, table|
           drop << "drop table #{table.to_a.first.last} cascade constraints;\n\n"
+        end
+
+        # drop views
+        select_all("select view_name from all_views where owner = sys_context('userenv','session_user') order by 1").inject(s) do |drop, view|
+          drop << "drop view #{view.to_a.first.last};\n\n"
+        end
+
+        # drop triggers. These are wrapped in quotes as any BIN$ objects will have characters needing to be escaped. 
+        # May need to do this for tables as well...
+        select_all("select trigger_name from all_triggers where owner = sys_context('userenv','session_user') order by 1").inject(s) do |drop, trigger|
+          trg = trigger.to_a.first.last
+          trg = trg.include?('BIN$') ? '"' + trg + '"' : trg
+          drop << "drop trigger #{trg};\n\n"
         end
       end
 
